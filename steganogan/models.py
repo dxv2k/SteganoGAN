@@ -34,6 +34,19 @@ METRIC_FIELDS = [
     'train.generated_score',
 ]
 
+torch.nn.Module.dump_patches = True
+
+from torch.optim import Adam
+
+# Patch Adam.__setstate__ for backwards compatibility with legacy checkpoints
+_original_adam_setstate = Adam.__setstate__
+def _patched_adam_setstate(self, state):
+    if not hasattr(self, 'defaults') or self.defaults is None:
+        # Supply an empty dict for missing defaults.
+        self.defaults = {}
+    _original_adam_setstate(self, state)
+
+Adam.__setstate__ = _patched_adam_setstate
 
 class SteganoGAN(object):
 
@@ -80,10 +93,20 @@ class SteganoGAN(object):
         self.encoder = self._get_instance(encoder, kwargs)
         self.decoder = self._get_instance(decoder, kwargs)
         self.critic = self._get_instance(critic, kwargs)
+        
+        # Compile models with torch.compile() for PyTorch 2.0 optimization
+        if torch.__version__ >= '2.0.0':
+            self.encoder = torch.compile(self.encoder)
+            self.decoder = torch.compile(self.decoder)
+            self.critic = torch.compile(self.critic)
+            
         self.set_device(cuda)
 
         self.critic_optimizer = None
         self.decoder_optimizer = None
+        
+        # Initialize gradient scaler for mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler(enabled=cuda)
 
         # Misc
         self.fit_metrics = None
@@ -141,19 +164,25 @@ class SteganoGAN(object):
         return critic_optimizer, decoder_optimizer
 
     def _fit_critic(self, train, metrics):
-        """Critic process"""
+        """Critic process with mixed precision training"""
         for cover, _ in tqdm(train, disable=not self.verbose):
             gc.collect()
             cover = cover.to(self.device)
-            payload = self._random_data(cover)
-            generated = self.encoder(cover, payload)
-            cover_score = self._critic(cover)
-            generated_score = self._critic(generated)
+            
+            # Autocast for mixed precision training
+            with torch.cuda.amp.autocast(enabled=self.cuda):
+                payload = self._random_data(cover)
+                generated = self.encoder(cover, payload)
+                cover_score = self._critic(cover)
+                generated_score = self._critic(generated)
+                loss = cover_score - generated_score
 
             self.critic_optimizer.zero_grad()
-            (cover_score - generated_score).backward(retain_graph=False)
-            self.critic_optimizer.step()
+            self.scaler.scale(loss).backward(retain_graph=False)
+            self.scaler.step(self.critic_optimizer)
+            self.scaler.update()
 
+            # Clamp critic weights
             for p in self.critic.parameters():
                 p.data.clamp_(-0.1, 0.1)
 
@@ -161,18 +190,23 @@ class SteganoGAN(object):
             metrics['train.generated_score'].append(generated_score.item())
 
     def _fit_coders(self, train, metrics):
-        """Fit the encoder and the decoder on the train images."""
+        """Fit the encoder and the decoder on the train images with mixed precision training."""
         for cover, _ in tqdm(train, disable=not self.verbose):
             gc.collect()
             cover = cover.to(self.device)
-            generated, payload, decoded = self._encode_decode(cover)
-            encoder_mse, decoder_loss, decoder_acc = self._coding_scores(
-                cover, generated, payload, decoded)
-            generated_score = self._critic(generated)
+            
+            # Autocast for mixed precision training
+            with torch.cuda.amp.autocast(enabled=self.cuda):
+                generated, payload, decoded = self._encode_decode(cover)
+                encoder_mse, decoder_loss, decoder_acc = self._coding_scores(
+                    cover, generated, payload, decoded)
+                generated_score = self._critic(generated)
+                loss = 100.0 * encoder_mse + decoder_loss + generated_score
 
             self.decoder_optimizer.zero_grad()
-            (100.0 * encoder_mse + decoder_loss + generated_score).backward()
-            self.decoder_optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.decoder_optimizer)
+            self.scaler.update()
 
             metrics['train.encoder_mse'].append(encoder_mse.item())
             metrics['train.decoder_loss'].append(decoder_loss.item())
@@ -186,23 +220,31 @@ class SteganoGAN(object):
         return encoder_mse, decoder_loss, decoder_acc
 
     def _validate(self, validate, metrics):
-        """Validation process"""
+        """Validation process with mixed precision"""
         for cover, _ in tqdm(validate, disable=not self.verbose):
             gc.collect()
             cover = cover.to(self.device)
-            generated, payload, decoded = self._encode_decode(cover, quantize=True)
-            encoder_mse, decoder_loss, decoder_acc = self._coding_scores(
-                cover, generated, payload, decoded)
-            generated_score = self._critic(generated)
-            cover_score = self._critic(cover)
+            
+            # Autocast for mixed precision validation
+            with torch.cuda.amp.autocast(enabled=self.cuda):
+                generated, payload, decoded = self._encode_decode(cover, quantize=True)
+                encoder_mse, decoder_loss, decoder_acc = self._coding_scores(
+                    cover, generated, payload, decoded)
+                generated_score = self._critic(generated)
+                cover_score = self._critic(cover)
+                
+                # Calculate SSIM and PSNR metrics
+                ssim_val = ssim(cover, generated)
+                psnr_val = 10 * torch.log10(4 / encoder_mse)
 
+            # Record metrics
             metrics['val.encoder_mse'].append(encoder_mse.item())
             metrics['val.decoder_loss'].append(decoder_loss.item())
             metrics['val.decoder_acc'].append(decoder_acc.item())
             metrics['val.cover_score'].append(cover_score.item())
             metrics['val.generated_score'].append(generated_score.item())
-            metrics['val.ssim'].append(ssim(cover, generated).item())
-            metrics['val.psnr'].append(10 * torch.log10(4 / encoder_mse).item())
+            metrics['val.ssim'].append(ssim_val.item())
+            metrics['val.psnr'].append(psnr_val.item())
             metrics['val.bpp'].append(self.data_depth * (2 * decoder_acc.item() - 1))
 
     def _generate_samples(self, samples_path, cover, epoch):
@@ -286,7 +328,7 @@ class SteganoGAN(object):
         return torch.FloatTensor(payload).view(1, depth, height, width)
 
     def encode(self, cover, output, text):
-        """Encode an image.
+        """Encode an image with mixed precision.
         Args:
             cover (str): Path to the image to be used as cover.
             output (str): Path where the generated image will be saved.
@@ -296,12 +338,14 @@ class SteganoGAN(object):
         cover = torch.FloatTensor(cover).permute(2, 1, 0).unsqueeze(0)
 
         cover_size = cover.size()
-        # _, _, height, width = cover.size()
         payload = self._make_payload(cover_size[3], cover_size[2], self.data_depth, text)
 
         cover = cover.to(self.device)
         payload = payload.to(self.device)
-        generated = self.encoder(cover, payload)[0].clamp(-1.0, 1.0)
+        
+        # Use mixed precision for encoding
+        with torch.cuda.amp.autocast(enabled=self.cuda):
+            generated = self.encoder(cover, payload)[0].clamp(-1.0, 1.0)
 
         generated = (generated.permute(2, 1, 0).detach().cpu().numpy() + 1.0) * 127.5
         imwrite(output, generated.astype('uint8'))
@@ -310,7 +354,7 @@ class SteganoGAN(object):
             print('Encoding completed.')
 
     def decode(self, image):
-
+        """Decode an image with mixed precision."""
         if not os.path.exists(image):
             raise ValueError('Unable to read %s.' % image)
 
@@ -319,7 +363,12 @@ class SteganoGAN(object):
         image = torch.FloatTensor(image).permute(2, 1, 0).unsqueeze(0)
         image = image.to(self.device)
 
-        image = self.decoder(image).view(-1) > 0
+        # Use mixed precision for decoding
+        with torch.cuda.amp.autocast(enabled=self.cuda):
+            decoded = self.decoder(image)
+        
+        # Convert to binary predictions
+        image = decoded.view(-1) > 0
 
         # split and decode messages
         candidates = Counter()
@@ -337,13 +386,70 @@ class SteganoGAN(object):
         return candidate
 
     def save(self, path):
-        """Save the fitted model in the given path. Raises an exception if there is no model."""
-        torch.save(self, path)
+        """Save the fitted model in the given path with PyTorch 2.0 compatibility."""
+        # Save model state without compilation
+        if torch.__version__ >= '2.0.0':
+            # Get original models before compilation
+            encoder = self.encoder._orig_mod if hasattr(self.encoder, '_orig_mod') else self.encoder
+            decoder = self.decoder._orig_mod if hasattr(self.decoder, '_orig_mod') else self.decoder
+            critic = self.critic._orig_mod if hasattr(self.critic, '_orig_mod') else self.critic
+            
+            # Temporarily store original models
+            compiled_encoder, compiled_decoder, compiled_critic = self.encoder, self.decoder, self.critic
+            self.encoder, self.decoder, self.critic = encoder, decoder, critic
+            
+            # Save the model
+            torch.save(self, path)
+            
+            # Restore compiled models
+            self.encoder, self.decoder, self.critic = compiled_encoder, compiled_decoder, compiled_critic
+        else:
+            torch.save(self, path)
+
+    # @classmethod
+    # def load(cls, architecture=None, path=None, cuda=True, verbose=False):
+    #     """Loads an instance of SteganoGAN with PyTorch 2.0 compatibility.
+
+    #     Args:
+    #         architecture(str): Name of a pretrained model to be loaded from the default models.
+    #         path(str): Path to custom pretrained model. *Architecture must be None.
+    #         cuda(bool): Force loaded model to use cuda (if available).
+    #         verbose(bool): Force loaded model to use or not verbose.
+    #     """
+    #     if architecture and not path:
+    #         model_name = '{}.steg'.format(architecture)
+    #         pretrained_path = os.path.join(os.path.dirname(__file__), 'pretrained')
+    #         path = os.path.join(pretrained_path, model_name)
+
+    #     elif (architecture is None and path is None) or (architecture and path):
+    #         raise ValueError(
+    #             'Please provide either an architecture or a path to pretrained model.')
+    
+    #     # Allowlist SteganoGAN (i.e. the current class) so that pickle can load it.
+    #     torch.serialization.add_safe_globals([cls])
+
+    #     steganogan = torch.load(path, map_location='cpu', weights_only=False)
+    #     steganogan.verbose = verbose
+
+    #     steganogan.encoder.upgrade_legacy()
+    #     steganogan.decoder.upgrade_legacy()
+    #     steganogan.critic.upgrade_legacy()
+
+    #     # Recompile models for PyTorch 2.0
+    #     if torch.__version__ >= '2.0.0':
+    #         steganogan.encoder = torch.compile(steganogan.encoder)
+    #         steganogan.decoder = torch.compile(steganogan.decoder)
+    #         steganogan.critic = torch.compile(steganogan.critic)
+
+    #     # Initialize gradient scaler for mixed precision training
+    #     steganogan.scaler = torch.cuda.amp.GradScaler(enabled=cuda)
+        
+    #     steganogan.set_device(cuda)
+    #     return steganogan
 
     @classmethod
     def load(cls, architecture=None, path=None, cuda=True, verbose=False):
-        """Loads an instance of SteganoGAN for the given architecture (default pretrained models)
-        or loads a pretrained model from a given path.
+        """Loads an instance of SteganoGAN with PyTorch 2.0 compatibility.
 
         Args:
             architecture(str): Name of a pretrained model to be loaded from the default models.
@@ -351,7 +457,6 @@ class SteganoGAN(object):
             cuda(bool): Force loaded model to use cuda (if available).
             verbose(bool): Force loaded model to use or not verbose.
         """
-
         if architecture and not path:
             model_name = '{}.steg'.format(architecture)
             pretrained_path = os.path.join(os.path.dirname(__file__), 'pretrained')
@@ -360,13 +465,29 @@ class SteganoGAN(object):
         elif (architecture is None and path is None) or (architecture and path):
             raise ValueError(
                 'Please provide either an architecture or a path to pretrained model.')
-
-        steganogan = torch.load(path, map_location='cpu')
+        
+        # Allowlist SteganoGAN (i.e. the current class) so that pickle can load it.
+        torch.serialization.add_safe_globals([cls])
+        
+        # Load only the model weights, ignoring extraneous state (e.g. optimizer states).
+        steganogan = torch.load(path, map_location='cpu', weights_only=False)
         steganogan.verbose = verbose
 
         steganogan.encoder.upgrade_legacy()
         steganogan.decoder.upgrade_legacy()
         steganogan.critic.upgrade_legacy()
 
+        # Recompile models for PyTorch 2.0, if applicable.
+        if torch.__version__ >= '2.0.0':
+            steganogan.encoder = torch.compile(steganogan.encoder)
+            steganogan.decoder = torch.compile(steganogan.decoder)
+            steganogan.critic = torch.compile(steganogan.critic)
+
+        # Reset optimizers (we ignore saved optimizer state to bypass __setstate__ errors).
+        steganogan.critic_optimizer = None
+        steganogan.decoder_optimizer = None
+
+        # Initialize gradient scaler for mixed precision training.
+        steganogan.scaler = torch.cuda.amp.GradScaler(enabled=cuda)
         steganogan.set_device(cuda)
         return steganogan

@@ -1,0 +1,55 @@
+# FROM nvidia/cuda:11.7.1-base-ubuntu20.04
+
+# ENV DEBIAN_FRONTEND=noninteractive
+
+# # Install system dependencies including Python & system libraries.
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     python3-pip \
+#     python3-dev \
+#     git \
+#     build-essential \
+#     cmake \
+#     libsm6 \
+#     libxext6 \
+#     libxrender-dev \
+#  && rm -rf /var/lib/apt/lists/*
+
+# # Set work directory.
+# WORKDIR /app
+
+# # Copy repository content into the image.
+# COPY . .
+
+# # Upgrade pip and install required Python packages.
+# # Updated to install a PyTorch version built for CUDA 11.7.
+# RUN pip3 install --upgrade pip && \
+#     pip3 install torch==1.13.0+cu117 -f https://download.pytorch.org/whl/torch_stable.html && \
+#     # pip3 install -e .
+#     pip3 install steganogan
+
+# # Default command to show help.
+# CMD ["steganogan", "--help"]
+
+FROM python:3.8-slim
+
+# Prevent interactive prompts during package installation.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies required for image processing and building any native extensions.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory.
+WORKDIR /app
+
+# Upgrade pip and install SteganoGAN from PyPI.
+RUN pip install --upgrade pip && \
+    pip install steganogan
+
+# Set the default command to show the SteganoGAN help output.
+CMD ["steganogan", "--help"]
