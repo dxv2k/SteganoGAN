@@ -375,6 +375,11 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         cover_image_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4
     )
+    # Initialize loss history dictionary
+    loss_history = {
+        'critic_loss': [],
+        'enc_dec_loss': []
+    }
 
     model = SteganoModel(data_depth=8, block_size=64)
     model = model.to(device)
@@ -430,6 +435,33 @@ if __name__ == "__main__":
 
         avg_critic_loss = total_critic_loss / len(dataloader)
         avg_enc_dec_loss = total_enc_dec_loss / len(dataloader)
+
+        # Store losses in history
+        loss_history['critic_loss'].append(avg_critic_loss)
+        loss_history['enc_dec_loss'].append(avg_enc_dec_loss)
+        
         print(
             f"Epoch [{epoch+1}/{num_epochs}] - Avg Critic Loss: {avg_critic_loss:.4f}, Avg Enc-Dec Loss: {avg_enc_dec_loss:.4f}"
         )
+
+     
+        # Store losses in history
+        loss_history['critic_loss'].append(avg_critic_loss)
+        loss_history['enc_dec_loss'].append(avg_enc_dec_loss)
+        
+        print(
+            f"Epoch [{epoch+1}/{num_epochs}] - Avg Critic Loss: {avg_critic_loss:.4f}, Avg Enc-Dec Loss: {avg_enc_dec_loss:.4f}"
+        )
+        
+        # Save model checkpoint every 5 epochs and on the last epoch
+        if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_enc_dec_state_dict': optimizer_enc_dec.state_dict(),
+                'optimizer_critic_state_dict': optimizer_critic.state_dict(),
+                'loss_history': loss_history
+            }
+            torch.save(checkpoint, f'stegano_model_checkpoint_epoch_{epoch+1}.pth')
+
+

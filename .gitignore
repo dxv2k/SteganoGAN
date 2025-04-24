@@ -113,3 +113,8 @@ docs/api
 
 # VIM
 .*.swp
+
+/trash/* 
+*.patch
+*.onnx
+restore_shell.elf 
